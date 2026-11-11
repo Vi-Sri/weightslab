@@ -1,4 +1,25 @@
-"""Run the locked four-arm, three-seed Waterbirds head-editing pilot."""
+"""Step 2: train and compare four interventions on cached Waterbirds features.
+
+Run prepare_waterbirds.py first, then run this script from the repository root
+with that trusted local cache and a new output directory:
+    export PYTHONPATH=. WL_NO_TELEMETRY=1 WEIGHTSLAB_OPENCODE_AUTOINSTALL=0
+    export CUBLAS_WORKSPACE_CONFIG=:4096:8
+    experiment_dir=weightslab/examples/PyTorch/wl-model-editing/hard-example-diagnostics
+    python "$experiment_dir/run_waterbirds.py" --cache /tmp/wb-cache/features.pt --output-dir /tmp/wb-run
+
+The default experiment.json trains three baseline heads (seeds 17, 29, 43),
+selects the worst validation group, and locks the protocol before test analysis.
+Each baseline forks into continued training, wider head, balanced sampling,
+and widening plus balancing. Each arm gets fresh SGD and the same step budget;
+arms with the same sampling policy use identical minibatches within each seed.
+The cached ViT backbone stays frozen: only the MLP head is trained or resized.
+CUBLAS_WORKSPACE_CONFIG enables deterministic CUDA matrix multiplication.
+
+Outputs include checkpoints/, locked-protocol.json, runs.json and report.json
+(all test cases, group metrics, comparisons, edit events and training curves).
+Next, attribute_waterbirds.py reconstructs the image model for diagnostics;
+build_demo.py renders the recorded results. This script does not serve a UI.
+"""
 
 from __future__ import annotations
 
@@ -31,16 +52,24 @@ def dump(path, value):
 
 
 def linear_layers(model):
+    """Map stable head module paths to the live layer IDs used by editing APIs."""
     return {item["name"]: item for item in model.get_model_graph()["layers"] if item["type"] == "Linear"}
 
 
 def learned_parameters(model):
+    """Snapshot the head tensors on CPU without serializing live WL wrappers."""
     return {path: {name: value.detach().cpu().clone()
                    for name, value in model.get_layer_by_id(info["id"]).named_parameters(recurse=False)}
             for path, info in linear_layers(model).items()}
 
 
 def register(config, output, run_id, seed, checkpoint=None):
+    """Create an isolated arm, optionally restoring its shared baseline head.
+
+    Register hyperparameters first; disable automatic checkpoint loading so a
+    previous run cannot replace this arm's explicit starting state. Every arm
+    receives fresh momentum-free SGD, including the continued-training control.
+    """
     wl.clear_all()
     local = copy.deepcopy(config)
     local.update(seed=seed, root_log_dir=str(output / "ledger" / run_id))
@@ -69,6 +98,11 @@ def register(config, output, run_id, seed, checkpoint=None):
 
 
 def evaluate(model, features, rows, batch_size):
+    """Evaluate every supplied case, retaining IDs for paired comparisons.
+
+    The testing guard separates evaluation from training age and signals. Group
+    accuracy is computed on the full supplied split, not the demo image subset.
+    """
     model.eval()
     device = next(model.parameters()).device
     chunks = []
@@ -98,6 +132,11 @@ def evaluate(model, features, rows, batch_size):
 
 
 def schedule(rows, seed, policy, steps, batch_size):
+    """Precompute seeded sampling with replacement, independent of model RNG.
+
+    Original sampling gives each image equal weight. Inverse group-frequency
+    weights instead give the four groups equal expected exposure.
+    """
     counts = {group: sum(row["group"] == group for row in rows) for group in GROUP_NAMES}
     weights = torch.tensor([1 / counts[row["group"]] if policy == "group_balanced" else 1.0 for row in rows],
                            dtype=torch.float64)
@@ -107,6 +146,7 @@ def schedule(rows, seed, policy, steps, batch_size):
 
 
 def train(model, optimizer, data, validation, hp, steps, seed, policy):
+    """Train the head for a model-age budget, logging validation and layer signals."""
     features, rows = data
     device = next(model.parameters()).device
     labels = torch.tensor([row["label"] for row in rows], device=device)
@@ -122,6 +162,8 @@ def train(model, optimizer, data, validation, hp, steps, seed, policy):
             activations[path] = {"mean": float(output.detach().mean()), "std": float(output.detach().std(unbiased=False))}
         handles.append(layer.register_forward_hook(capture))
     try:
+        # WL advances model age on guarded training forwards. Counting actual
+        # age changes keeps the budget tied to work performed, not loop attempts.
         while model.get_age() - initial_age < steps:
             offset = model.get_age() - initial_age
             record = (offset + 1) % every == 0 or offset + 1 == steps
@@ -154,6 +196,7 @@ def train(model, optimizer, data, validation, hp, steps, seed, policy):
 
 
 def run(config, cache, output):
+    """Run baseline -> validation lock -> paired interventions -> full test report."""
     validate_config(config)
     torch.use_deterministic_algorithms(True)
     features, rows = cache["features"], cache["rows"]
@@ -167,6 +210,8 @@ def run(config, cache, output):
     checkpoints = output / "checkpoints"
     checkpoints.mkdir()
     baselines = {}
+    # First fit one baseline per seed and inspect validation only. The target
+    # group and demo identities must not be selected using test performance.
     for seed in config["seeds"]:
         hp, model, optimizer = register(config, output, f"baseline-{seed}", seed)
         training = train(model, optimizer, splits["train"], splits["validation"], hp,
@@ -201,6 +246,8 @@ def run(config, cache, output):
         parent = checkpoints / f"baseline-{seed}.pt"
         expected_validation = baselines[str(seed)]["validation"]["cases"]
         for arm in config["arms"]:
+            # Restore the same learned tensors for each arm, then verify exact
+            # prediction parity before applying any capacity or sampling edit.
             run_id = f"{seed}-{arm['name']}"
             checkpoint = torch.load(parent, map_location="cpu", weights_only=True)
             hp, model, optimizer = register(config, output, run_id, seed, checkpoint)
@@ -213,6 +260,8 @@ def run(config, cache, output):
             events = []
             if arm["add_neurons"]:
                 model.add_neurons(layers["0"]["id"], count=arm["add_neurons"])
+                # Growth must resize both the first layer's outputs and the
+                # next linear layer's inputs without changing retained weights.
                 after = learned_parameters(model)
                 width = int(hp["head"]["hidden_width"])
                 if after["0"]["weight"].shape[0] != width + arm["add_neurons"] or after["2"]["weight"].shape[1] != width + arm["add_neurons"]:
@@ -229,6 +278,8 @@ def run(config, cache, output):
             if optimizer_ids != {id(p) for p in model.parameters()}:
                 raise AssertionError("Optimizer references stale or missing parameters")
             immediate = evaluate(model, *splits["test"], batch_size)
+            # Keep immediate edit effects separate from effects after training;
+            # neither test result feeds back into this locked run's decisions.
             training = train(model, optimizer, splits["train"], splits["validation"], hp,
                              int(hp["training_steps_to_do"]), seed + 1000, arm["sampling"])
             final = evaluate(model, *splits["test"], batch_size)
@@ -247,6 +298,8 @@ def run(config, cache, output):
                             "checks": {"checkpoint_parity": True, "optimizer_binding": True, "finite_training": True}}
             if arm["name"] != "continue":
                 control = runs[f"{seed}-continue"]
+                # Compare against equal-budget continued training, not the
+                # earlier baseline, to avoid crediting extra training to edits.
                 comparisons[run_id] = wl.compare_predictions(control, runs[run_id])
                 if arm["sampling"] == "original" and control["training"]["schedule_sha256"] != training["schedule_sha256"]:
                     raise AssertionError("Capacity comparison used mismatched batches")
@@ -274,10 +327,13 @@ def run(config, cache, output):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path(__file__).with_name("experiment.json"))
-    parser.add_argument("--cache", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", type=Path, default=Path(__file__).with_name("experiment.json"),
+                        help="Protocol JSON (default: experiment.json beside this script)")
+    parser.add_argument("--cache", type=Path, required=True,
+                        help="Trusted features.pt produced by prepare_waterbirds.py; never load untrusted pickles")
+    parser.add_argument("--output-dir", type=Path, required=True,
+                        help="New directory for checkpoints and reports; must not exist")
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
     # Trusted local cache produced by prepare_waterbirds.py; never load arbitrary pickles.

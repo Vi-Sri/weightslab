@@ -1,4 +1,24 @@
-"""Measured class-conditioned input attribution for locked validation cases."""
+"""Step 3: explain recorded predictions with image-space Integrated Gradients.
+
+Run prepare_waterbirds.py and run_waterbirds.py first. From the repository root:
+    export PYTHONPATH=. WL_NO_TELEMETRY=1 WEIGHTSLAB_OPENCODE_AUTOINSTALL=0
+    experiment_dir=weightslab/examples/PyTorch/wl-model-editing/hard-example-diagnostics
+    python "$experiment_dir/attribute_waterbirds.py" --run-dir /tmp/wb-run --dataset-root /data/waterbirds
+
+The run directory must contain report.json and checkpoints/; use the same
+extracted images and compatible experiment config as training. This script
+reconstructs frozen ViT + trained head and checks its logits against the cached
+feature run before computing any maps. Defaults explain one locked validation
+case per group, for the first seed, across the baseline and four final arms.
+
+attribution.json contains model crops, signed pixel attribution, overlays and
+numerical completeness checks for build_demo.py. Use --output to write a
+separate export; otherwise an existing run-dir/attribution.json is replaced.
+The target is always the dataset-class logit, even for misclassified images.
+These are output-conditioned attributions, not attention maps: head edits can
+change them while the backbone's attention remains frozen. A changed map does
+not by itself demonstrate a corrected prediction or a learned concept.
+"""
 
 from __future__ import annotations
 
@@ -19,7 +39,13 @@ import weightslab as wl
 
 
 def integrated_gradients(model, image, target, steps, batch_size):
-    """Gauss-Legendre IG from zero normalized input; return signed completeness error."""
+    """Attribute one normalized image's target logit using Gauss-Legendre IG.
+
+    Integrate input gradients from a zero normalized image (ImageNet mean color)
+    to the actual input. Return the channel-wise attribution, its signed
+    completeness error and the input-minus-baseline logit difference. The error
+    checks numerical integration accuracy, not the explanation's correctness.
+    """
     points, weights = np.polynomial.legendre.leggauss(steps)
     points = torch.tensor((points + 1) / 2, device=image.device, dtype=image.dtype)
     weights = torch.tensor(weights / 2, device=image.device, dtype=image.dtype)
@@ -45,11 +71,15 @@ def image_uri(image):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--dataset-root", type=Path, required=True)
-    parser.add_argument("--output", type=Path, help="Optional attribution output; leaves the original export intact")
-    parser.add_argument("--config", type=Path, default=Path(__file__).with_name("experiment.json"))
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--run-dir", type=Path, required=True,
+                        help="Completed run_waterbirds.py directory containing report.json and checkpoints/")
+    parser.add_argument("--dataset-root", type=Path, required=True,
+                        help="The same extracted Waterbirds images used for the feature cache")
+    parser.add_argument("--output", type=Path,
+                        help="Output JSON (default: replaces run-dir/attribution.json); choose another path to preserve it")
+    parser.add_argument("--config", type=Path, default=Path(__file__).with_name("experiment.json"),
+                        help="Compatible protocol and IG settings (default: adjacent experiment.json)")
     args = parser.parse_args()
     report = json.loads((args.run_dir / "report.json").read_text())
     config = json.loads(args.config.read_text())
@@ -64,12 +94,16 @@ def main():
     weights = ViT_B_16_Weights[str(hp["backbone"]["weights"])]
     backbone = vit_b_16(weights=weights).eval().to(device)
     backbone.heads = nn.Identity()
+    # Freeze parameters, but not input gradients: IG still differentiates
+    # through the entire image -> backbone -> head computation below.
     backbone.requires_grad_(False)
     weight_path = Path(torch.hub.get_dir()) / "checkpoints" / weights.url.rsplit("/", 1)[-1]
     if sha256(weight_path) != report["feature_provenance"]["weights_sha256"]:
         raise ValueError("Attribution backbone weights differ from the feature cache")
     seed = report["protocol"]["config"]["seeds"][0]
     candidates = report["runs"][f"{seed}-continue"]["demo_validation"]
+    # Reuse identities locked from baseline validation; do not search the test
+    # set for visually appealing maps or select cases based on an intervention.
     selected = []
     for group in report["group_names"]:
         selected.extend([case for case in candidates if case["group"] == group][:int(hp["attribution_cases_per_group"])])
@@ -90,6 +124,8 @@ def main():
         for name in names:
             filename = f"baseline-{seed}.pt" if name == "baseline" else f"{seed}-{name}.pt"
             state = torch.load(args.run_dir / "checkpoints" / filename, map_location="cpu", weights_only=True)
+            # Infer widths from each saved head: widening changes both adjacent
+            # tensors, so the original config width alone cannot reconstruct it.
             head = nn.Sequential(nn.Linear(state["0"]["weight"].shape[1], state["0"]["weight"].shape[0]),
                                  nn.LeakyReLU(float(hp["head"]["negative_slope"])),
                                  nn.Linear(state["2"]["weight"].shape[1], state["2"]["weight"].shape[0]))
@@ -103,6 +139,8 @@ def main():
             if not torch.allclose(logits, torch.tensor(expected["logits"]), atol=1e-4, rtol=1e-4):
                 raise AssertionError("Full image model disagrees with cached-feature predictions")
             steps = int(hp["attribution_steps"])
+            # Increase quadrature resolution until tolerance or the configured
+            # limit. Failed checks remain explicit in the export, not hidden.
             while True:
                 attribution, delta, difference = integrated_gradients(model, tensor, case["label"], steps,
                                                                       int(hp["attribution_batch_size"]))
@@ -117,6 +155,8 @@ def main():
                              "confidence": expected["confidence"], "true_label_margin": expected["true_label_margin"]}
             print(f"Attributed {case['sample_id']} / {name}: steps={steps}, delta={delta:.5f}, passed={converged}", flush=True)
         scale = max(float(np.abs(values).max()) for values in attribution_maps.values())
+        # All snapshots of this image share a scale, so separate normalization
+        # cannot make a weaker attribution look as strong as a stronger one.
         for name, values in attribution_maps.items():
             # Preserve signed, unclipped values for honest browser-side rendering.
             entries[name]["attribution"] = {

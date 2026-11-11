@@ -58,6 +58,7 @@ must separately verify identical parent weights, shape/optimizer correctness,
 sampling policies and saved-artifact hashes. Dataset-weighted averages and
 multi-seed uncertainty are the experiment's responsibility.
 
-The ``wl-model-editing/hard-example-diagnostics`` example exercises this API
-in a four-arm Waterbirds pilot and exports an offline comparison page. That
-page is a recorded-run prototype, not a new live Studio screen or RPC.
+The ``weightslab/examples/PyTorch/wl-model-editing/hard-example-diagnostics``
+example exercises this API in a four-arm Waterbirds pilot and exports an offline
+comparison page. That page is a recorded-run prototype, not a new live Studio
+screen or RPC.

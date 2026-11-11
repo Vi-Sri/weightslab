@@ -36,6 +36,16 @@ _LAZY_EXPORTS = {
     "guard_training_context": (".components.global_monitoring", "guard_training_context"),
     "guard_testing_context": (".components.global_monitoring", "guard_testing_context"),
     "compare_predictions": (".diagnostics", "compare_predictions"),
+    # Keep YOLO(...).train(trainer=wl.WLAwareTrainer, ...) available without a
+    # deep import. Ultralytics is optional: load it only when a name is used.
+    "WLAwareTrainer": (".integrations.ultralytics", "WLAwareTrainer"),
+    "WLAwareSegmentationTrainer": (".integrations.ultralytics", "WLAwareSegmentationTrainer"),
+    "WLAwareDataset": (".integrations.ultralytics", "WLAwareDataset"),
+    "WLAwareSegmentationDataset": (".integrations.ultralytics", "WLAwareSegmentationDataset"),
+}
+# Give users the install command when an optional export's dependency is absent.
+_MISSING_EXTRA = {
+    ".integrations.ultralytics": ("ultralytics", "weightslab[ultralytics]"),
 }
 # Everything re-exported straight from .src (attribute name == export name).
 for _name in (
